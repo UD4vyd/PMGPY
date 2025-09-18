@@ -394,7 +394,7 @@ def main():
     for k, v in causal.items():
         print(f"{k}: {v:.4f}")
 
-    print("\n✅ Flujo completo finalizado.")
+    print("\n Flujo completo finalizado.")
 
 
 if __name__ == "__main__":
