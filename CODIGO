@@ -1,0 +1,401 @@
+"""
+app.py — Demostración práctica de pgmpy con un caso de diagnóstico respiratorio.
+Autor: Tú :)
+
+Resumen
+-------
+Este script muestra un flujo de trabajo "de punta a punta" con pgmpy:
+
+1) Definición de una red bayesiana (BN) "verdadera" de referencia (ground-truth).
+2) Simulación de datos sintéticos a partir de esa BN.
+3) Aprendizaje de estructura desde datos (Hill-Climb + BIC).
+4) Aprendizaje de parámetros (Máxima Verosimilitud) para el modelo aprendido.
+5) Inferencia exacta (Variable Elimination) con evidencia.
+6) Consulta MAP (asignación más probable).
+7) Simulación/muestreo de nuevos datos del modelo aprendido.
+8) Persistencia del modelo (guardar/cargar en BIF).
+9) Evaluación simple: comparación de BIC de la estructura aprendida vs. la verdadera.
+10) "Intervención" estilo do(X=x): función utilitaria para cortar aristas entrantes y fijar CPD.
+
+El caso: diagnóstico respiratorio (de juguete)
+----------------------------------------------
+Variables binarias (0/1):
+- S: fuma (smoker)
+- V: temporada viral (viral season)
+- D: enfermedad respiratoria
+- F: fiebre
+- C: tos
+- X: test positivo (rápido)
+
+Estructura "verdadera" (DAG):
+S → D, V → D, D → F, D → C, D → X, C → X
+
+La idea: S y V aumentan el riesgo de D. Si hay D, sube la probabilidad de F, C y X,
+y además C aumenta la probabilidad de X (p. ej., el test es más sensible si hay tos).
+
+Requisitos
+----------
+pip install pgmpy pandas numpy
+
+Probado con: Python 3.10+ (recomendado), pgmpy >= 0.1.24
+"""
+
+from __future__ import annotations
+import copy
+from typing import Optional, Sequence, Dict, Any
+
+import numpy as np
+import pandas as pd
+
+from pgmpy.models import BayesianNetwork
+from pgmpy.factors.discrete import TabularCPD
+from pgmpy.sampling import BayesianModelSampling
+from pgmpy.inference import VariableElimination
+from pgmpy.estimators import HillClimbSearch, BicScore, MaximumLikelihoodEstimator
+from pgmpy.readwrite import BIFWriter, BIFReader
+
+
+# --------------------------------------------------------------------------------------
+# 1) Definir la BN "ground-truth" (estructura + CPDs)
+# --------------------------------------------------------------------------------------
+def build_ground_truth_model() -> BayesianNetwork:
+    """
+    Construye el modelo de referencia con estructura y CPDs discretas binarias.
+
+    Estructura:
+        S -> D, V -> D, D -> F, D -> C, D -> X, C -> X
+
+    Returns
+    -------
+    BayesianNetwork
+    """
+    edges = [
+        ("S", "D"),
+        ("V", "D"),
+        ("D", "F"),
+        ("D", "C"),
+        ("D", "X"),
+        ("C", "X"),
+    ]
+    model = BayesianNetwork(edges)
+
+    # Priors
+    cpd_S = TabularCPD("S", 2, values=[[0.7], [0.3]])  # 30% fumadores
+    cpd_V = TabularCPD("V", 2, values=[[0.6], [0.4]])  # 40% temporada viral
+
+    # D depende de S y V
+    # Orden de evidencia ['S','V']; cada columna corresponde a combinación de (S,V) en orden cartesiano
+    # pgmpy usa orden lexicográfico sobre evidence_card; cuidamos consistencia manualmente.
+    # Combinaciones (S,V): (0,0),(0,1),(1,0),(1,1)
+    cpd_D = TabularCPD(
+        "D",
+        2,
+        values=[
+            [0.97, 0.90, 0.90, 0.75],  # P(D=0 | S,V)
+            [0.03, 0.10, 0.10, 0.25],  # P(D=1 | S,V)
+        ],
+        evidence=["S", "V"],
+        evidence_card=[2, 2],
+    )
+
+    # F, C, X dependen de D; X también depende de C (D y C)
+    cpd_F = TabularCPD(
+        "F",
+        2,
+        values=[
+            [0.95, 0.30],  # P(F=0 | D)
+            [0.05, 0.70],  # P(F=1 | D)
+        ],
+        evidence=["D"],
+        evidence_card=[2],
+    )
+    cpd_C = TabularCPD(
+        "C",
+        2,
+        values=[
+            [0.90, 0.25],  # P(C=0 | D)
+            [0.10, 0.75],  # P(C=1 | D)
+        ],
+        evidence=["D"],
+        evidence_card=[2],
+    )
+    # X depende de D y C (orden evidencia ["D","C"] -> columnas (D,C): (0,0),(0,1),(1,0),(1,1))
+    cpd_X = TabularCPD(
+        "X",
+        2,
+        values=[
+            [0.98, 0.90, 0.30, 0.10],  # P(X=0 | D,C)
+            [0.02, 0.10, 0.70, 0.90],  # P(X=1 | D,C)
+        ],
+        evidence=["D", "C"],
+        evidence_card=[2, 2],
+    )
+
+    model.add_cpds(cpd_S, cpd_V, cpd_D, cpd_F, cpd_C, cpd_X)
+    assert model.check_model(), "El modelo ground-truth no es consistente"
+    return model
+
+
+# --------------------------------------------------------------------------------------
+# 2) Simular datos sintéticos desde el modelo de referencia
+# --------------------------------------------------------------------------------------
+def simulate_data(model: BayesianNetwork, n: int = 5000, seed: int = 42) -> pd.DataFrame:
+    """
+    Genera un DataFrame de tamaño n con muestras de la BN.
+
+    Parameters
+    ----------
+    model : BayesianNetwork
+    n : int
+    seed : int
+
+    Returns
+    -------
+    pandas.DataFrame
+    """
+    rng = np.random.default_rng(seed)
+    sampler = BayesianModelSampling(model)
+    # forward_sample ignora RNG externo; fijamos seed controlando NumPy global seudamente
+    np.random.seed(seed)
+    df = sampler.forward_sample(size=n)
+    # Asegurar tipos int (a veces llega como category)
+    return df.astype(int)
+
+
+# --------------------------------------------------------------------------------------
+# 3) Aprendizaje de estructura con Hill-Climb + BIC
+# --------------------------------------------------------------------------------------
+def learn_structure(df: pd.DataFrame) -> BayesianNetwork:
+    """
+    Aprende un DAG con Hill-Climb y BIC a partir de los datos.
+
+    Returns
+    -------
+    BayesianNetwork
+    """
+    hc = HillClimbSearch(df, scoring_method=BicScore(df))
+    best_model = hc.estimate()  # por defecto intentará mejorar desde vacío y otras heurísticas
+    learned = BayesianNetwork(best_model.edges())
+    return learned
+
+
+# --------------------------------------------------------------------------------------
+# 4) Aprendizaje de parámetros (MLE) sobre el DAG aprendido
+# --------------------------------------------------------------------------------------
+def fit_parameters(model: BayesianNetwork, df: pd.DataFrame) -> BayesianNetwork:
+    """
+    Ajusta CPDs por Máxima Verosimilitud en el modelo (estructura dada).
+
+    Returns
+    -------
+    BayesianNetwork
+    """
+    model_fit = copy.deepcopy(model)
+    model_fit.fit(df, estimator=MaximumLikelihoodEstimator)
+    assert model_fit.check_model(), "Modelo aprendido no consistente tras el fit."
+    return model_fit
+
+
+# --------------------------------------------------------------------------------------
+# 5) Inferencia exacta y MAP
+# --------------------------------------------------------------------------------------
+def run_inference(model: BayesianNetwork) -> Dict[str, Any]:
+    """
+    Ejecuta consultas típicas de inferencia:
+    - Posterior P(D|F=1,C=1)
+    - MAP para D dado evidencia
+    - Marginal de X sin evidencia
+
+    Returns
+    -------
+    dict con resultados serializables/imprimibles
+    """
+    infer = VariableElimination(model)
+
+    q1 = infer.query(variables=["D"], evidence={"F": 1, "C": 1})
+    map_d = infer.map_query(variables=["D"], evidence={"F": 1, "C": 1})
+    q2 = infer.query(variables=["X"])  # marginal sin evidencia
+
+    # Serializamos resultados en forma amigable:
+    res = {
+        "P(D|F=1,C=1)": {int(state): float(prob) for state, prob in enumerate(q1.values)},
+        "MAP(D | F=1,C=1)": int(map_d["D"]),
+        "P(X)": {int(state): float(prob) for state, prob in enumerate(q2.values)},
+    }
+    return res
+
+
+# --------------------------------------------------------------------------------------
+# 6) Muestreo del modelo aprendido
+# --------------------------------------------------------------------------------------
+def sample_from_model(model: BayesianNetwork, k: int = 10) -> pd.DataFrame:
+    sampler = BayesianModelSampling(model)
+    samples = sampler.forward_sample(size=k).astype(int)
+    return samples
+
+
+# --------------------------------------------------------------------------------------
+# 7) Persistencia: guardar y cargar en BIF
+# --------------------------------------------------------------------------------------
+def persist_model(model: BayesianNetwork, path: str = "modelo_aprendido.bif") -> BayesianNetwork:
+    writer = BIFWriter(model)
+    writer.write_bif(path)
+    reader = BIFReader(path)
+    loaded = reader.get_model()
+    assert set(loaded.nodes()) == set(model.nodes())
+    assert set(loaded.edges()) == set(model.edges())
+    return loaded
+
+
+# --------------------------------------------------------------------------------------
+# 8) Evaluación simple: comparar BIC en validación
+# --------------------------------------------------------------------------------------
+def compare_bic(df_train: pd.DataFrame, df_valid: pd.DataFrame,
+                learned: BayesianNetwork, truth: BayesianNetwork) -> Dict[str, float]:
+    """
+    Compara BIC de la estructura aprendida vs. la verdadera en un conjunto de validación.
+
+    Nota: BIC depende de los datos y penaliza complejidad; aquí solo es una señal
+    comparativa simple, no una métrica absoluta de causalidad/correctitud.
+
+    Returns
+    -------
+    dict con BIC_learned, BIC_truth
+    """
+    # Ajustamos parámetros en cada estructura con TRAIN, y medimos BIC con VALID
+    learned_fit = fit_parameters(learned, df_train)
+    truth_fit = fit_parameters(truth, df_train)
+
+    bic_valid = BicScore(df_valid)
+    return {
+        "BIC(struct_learned | valid)": float(bic_valid.score(learned_fit)),
+        "BIC(struct_truth | valid)": float(bic_valid.score(truth_fit)),
+    }
+
+
+# --------------------------------------------------------------------------------------
+# 9) "Intervención" do(X=x): utilidad sencilla (corta padres de X y fija CPD)
+# --------------------------------------------------------------------------------------
+def do_intervention(model: BayesianNetwork, var: str, value: Optional[int] = None,
+                    distribution: Optional[Sequence[float]] = None) -> BayesianNetwork:
+    """
+    Crea un modelo intervenido al estilo do(var=valor):
+    - Elimina TODAS las aristas entrantes a `var`.
+    - Sustituye la CPD de `var` por una distribución sin padres.
+      Si `value` está dado (int), crea CPD determinista.
+      Si `distribution` se da (lista de probs), usa esa dist. (debe sumar 1).
+
+    Si el modelo original no tiene CPD para `var`, asume cardinalidad 2.
+
+    Returns
+    -------
+    BayesianNetwork intervenido
+    """
+    intervened = copy.deepcopy(model)
+
+    # 1) Quitar aristas entrantes
+    for parent in list(intervened.get_parents(var)):
+        intervened.remove_edge(parent, var)
+
+    # 2) Cardinalidad de la variable
+    try:
+        old_cpd = intervened.get_cpds(var)
+        card = old_cpd.variable_card
+        # eliminar CPD antigua
+        intervened.remove_cpds(old_cpd)
+    except Exception:
+        card = 2  # respaldo: binaria
+
+    # 3) Nueva CPD sin padres
+    if value is not None:
+        probs = [0.0] * card
+        probs[int(value)] = 1.0
+        new_cpd = TabularCPD(var, card, values=[probs])
+    elif distribution is not None:
+        assert len(distribution) == card, "Longitud de 'distribution' no coincide con cardinalidad."
+        assert abs(sum(distribution) - 1.0) < 1e-8, "La distribución debe sumar 1."
+        new_cpd = TabularCPD(var, card, values=[list(distribution)])
+    else:
+        raise ValueError("Especifica 'value' (determinista) o 'distribution' (probabilística).")
+
+    intervened.add_cpds(new_cpd)
+    assert intervened.check_model(), "Modelo intervenido inconsistente"
+    return intervened
+
+
+def causal_query_example(model: BayesianNetwork) -> Dict[str, Any]:
+    """
+    Ejemplo: comparar P(D=1) vs. P(D=1 | do(S=0)).
+
+    Interpreta S como 'fuma'; do(S=0) equivale a intervenir para que no se fume,
+    removiendo las causas originales de S (si las hubiera) y fijando su CPD.
+
+    Returns
+    -------
+    dict con probabilidades marginales originales y tras la intervención.
+    """
+    # P(D=1) original
+    infer = VariableElimination(model)
+    pD = infer.query(variables=["D"])
+    pD1 = float(pD.values[1])
+
+    # Intervención
+    m_do = do_intervention(model, var="S", value=0)
+    infer_do = VariableElimination(m_do)
+    pD_do = infer_do.query(variables=["D"])
+    pD1_do = float(pD_do.values[1])
+
+    return {"P(D=1)": pD1, "P(D=1 | do(S=0))": pD1_do}
+
+
+# --------------------------------------------------------------------------------------
+# MAIN: orquestación del flujo completo
+# --------------------------------------------------------------------------------------
+def main():
+    # 1) Ground-truth y simulación
+    truth = build_ground_truth_model()
+    df = simulate_data(truth, n=5000, seed=7)
+
+    # Dividir train/valid
+    df_train = df.sample(frac=0.7, random_state=7)
+    df_valid = df.drop(df_train.index)
+
+    # 2) Aprender estructura y 3) parámetros
+    learned_struct = learn_structure(df_train)
+    learned_model = fit_parameters(learned_struct, df_train)
+
+    # 3b) Imprimir estructuras
+    print("Estructura VERDADERA:", sorted(truth.edges()))
+    print("Estructura APRENDIDA:", sorted(learned_model.edges()))
+
+    # 4) Inferencia y MAP
+    results = run_inference(learned_model)
+    print("\n--- Inferencia (modelo aprendido) ---")
+    for k, v in results.items():
+        print(k, "=>", v)
+
+    # 5) Muestreo de nuevos registros
+    print("\n--- Muestras del modelo aprendido ---")
+    print(sample_from_model(learned_model, k=10))
+
+    # 6) Persistencia
+    loaded = persist_model(learned_model, path="modelo_aprendido.bif")
+    print("\nModelo guardado y recargado. Nº aristas:", len(loaded.edges()))
+
+    # 7) Evaluación simple (BIC en validación)
+    print("\n--- Comparación BIC en validación ---")
+    bic_scores = compare_bic(df_train, df_valid, learned_struct, truth)
+    for k, v in bic_scores.items():
+        print(f"{k}: {v:.2f}")
+
+    # 8) Ejemplo de "intervención" causal
+    print("\n--- Consulta causal (intervención do) ---")
+    causal = causal_query_example(learned_model)
+    for k, v in causal.items():
+        print(f"{k}: {v:.4f}")
+
+    print("\n✅ Flujo completo finalizado.")
+
+
+if __name__ == "__main__":
+    main()
